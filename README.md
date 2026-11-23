@@ -3,6 +3,9 @@
 工程师排查「打分时到底用了什么读数、哪些读数后来才变」的核对服务。
 FastAPI + SQLite，`/docs` 可直接操作全部接口。
 
+附带**离线回放**能力：同一张回执在两份报告里结论不同时，可导出脱敏回放包，
+交给厂商在脱离生产库的回放容器里按原核对逻辑重跑两份报告、定位前后变化。
+
 ## 业务口径
 
 时间一律 **UTC**，采样与打分都按分钟对齐。
@@ -47,17 +50,23 @@ FastAPI + SQLite，`/docs` 可直接操作全部接口。
 
 ```bash
 docker compose up --build -d
-open http://127.0.0.1:8000/docs
+open http://127.0.0.1:8000/docs   # 生产对账 API
+open http://127.0.0.1:8001/docs   # 离线回放服务
 ```
 
-数据落在命名卷 `windscore-data`（`/data/windscore.db`），重启不丢。
-端口可用环境变量覆盖：`WINDSCORE_PORT=9000 docker compose up -d`。
+compose 启动两个服务（同一镜像）：
+
+| 服务 | 端口 | 说明 |
+| --- | --- | --- |
+| `api` | `${WINDSCORE_PORT:-8000}` | 生产对账 API，数据落在命名卷 `windscore-data`（`/data/windscore.db`），重启不丢 |
+| `replay` | `${WINDSCORE_REPLAY_PORT:-8001}` | 离线回放服务（`app.replay_main`），**不挂生产数据卷、无数据库句柄**，`mem_limit: 128m` |
 
 本地直接跑：
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn app.main:app --reload                 # 对账 API
+uvicorn app.replay_main:app --port 8001       # 离线回放服务
 ```
 
 ## 接口一览
@@ -72,7 +81,16 @@ uvicorn app.main:app --reload
 | GET | `/api/reports` | 报告列表 |
 | GET | `/api/reports/{report_id}` | 按编号取报告（含两份清单与依据，可分页/按回执筛） |
 | GET | `/api/receipts/{receipt_id}/reports` | 反查某回执出现在哪些报告里 |
+| POST | `/api/export/replay-bundle` | 导出两份报告的脱敏回放包（JSON 下载） |
 | GET | `/api/readings`、`/api/receipts` | 查看已导入数据 |
+| GET | `/health` | 健康检查 |
+
+回放服务（`replay` 容器，默认 8001 端口）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/replay` | 上传回放包（JSON 请求体），重跑两份报告 |
+| POST | `/api/replay/import` | 上传回放包文件，同上 |
 | GET | `/health` | 健康检查 |
 
 ### 导入字段
@@ -107,6 +125,55 @@ curl -X POST localhost:8000/api/reconcile -H 'content-type: application/json' \
 该回执的结论：`usage` 报换版（用了 rev 1，应取 rev 2），`drift` 也报换版
 （rev 5 在 11:20 才入仓，属事后回填）。报告可直接用返回的 `report_id` 再查。
 
+## 离线回放（厂商复现）
+
+场景：同一张打分回执在两份已存报告里结论不同（例如期间发生了**同号更正**——
+同一 (机组, 采样分钟, 修订号) 被重新入仓、覆盖了入仓时刻），厂商需要离线复现原因。
+
+**第一步：导出回放包**（生产 API，`/docs` 可操作）
+
+```bash
+curl -X POST localhost:8000/api/export/replay-bundle \
+  -H 'content-type: application/json' \
+  -d '{"report_ids": ["rpt_aaa...", "rpt_bbb..."], "receipt_ids": ["R-1", "R-2"]}' \
+  -o replay-bundle.json
+```
+
+* 必须恰好两份**不同**的已存报告；`receipt_ids` 为两份报告的**共有回执号**，
+  最多 100 个；缺省取全部共有回执（超过 100 返回 413，需显式指定）。
+* 包内**只用报告保存的回执和修订轨迹**（`report_items` 的快照），不读生产表；
+  补录前缺的行在包里照旧缺失。
+* 脱敏规则：报告号 → `R1`/`R2`（按报告创建时间排序，R1 为前）、机组号 → `T1`…、
+  回执号 → `RC0001`…；采样/入仓/打分时间 → 相对同一未公开起点的偏移
+  （分钟偏移 / 微秒偏移）；风速只留空值标记 `wind_missing`；
+  相同的脱敏修订在 `revision_pool` 里只存一份，各报告经各自的 `tracks` 引用，
+  每份报告仍只用自己的回执和修订。
+
+**第二步：离线重跑**（回放服务，脱离生产库）
+
+```bash
+curl -X POST localhost:8001/api/replay/import -F 'file=@replay-bundle.json' -o replay-result.json
+```
+
+回放服务没有任何数据库句柄，只认上传的包。它把包内偏移映射到一个合成纪元，
+逐回执调用**与线上一致的核对代码**（`app.engine`）重跑两份报告，返回：
+
+* 每张回执在每份报告下的 `usage` / `drift` 差异类型与三侧（实际用数 / 当时应取 /
+  当前最高修订）所选修订；
+* 每条修订的入仓标记（`ingested_before_score`）与入选标记（`eligible`）；
+* `stored_vs_replay`：重跑结论与报告保存结论的前后变化（全部为空 = 完整复现）；
+* `report_changes`：同一回执在两份报告之间的前后变化（差异类型、三侧、
+  逐修订 `added` / `removed` / `reingested` / `markers`）。
+
+**原子性与限内存**
+
+* 两份报告的结果齐全才返回；包内引用找不到对应条目（422）或重算失败（500）时，
+  整次只返回错误，不出部分结果。
+* 回放按回执逐个计算、结果先写入溢出式临时文件（内存上限 8 MiB，超出落盘）再流式返回；
+  同一轨迹的修订行只重建一次。回放容器限 128 MiB 时，100 张共有回执指向同一采样分钟、
+  两份报告各 4,000 条修订的场景也能返回完整结果（compose 里 `replay` 服务即
+  `mem_limit: 128m`，测试用 RLIMIT_AS=128 MiB 的子进程验证）。
+
 ## 测试
 
 ```bash
@@ -117,4 +184,7 @@ python -m ruff check app tests --select F,E9
 
 覆盖：窗口边界（起点含、终点不含）、入仓时刻与打分同刻、缺行/缺测、
 事后补录的 drift、批次中并发补录不影响快照、报告失败不留存、
-单批 SQL 条数与 1 万条上限、CSV/JSON/中文表头导入等。
+单批 SQL 条数与 1 万条上限、CSV/JSON/中文表头导入、
+回放包导出（脱敏、修订去重、共有回执校验、只用报告保存的数据）、
+同号更正的离线复现、包内引用缺失/重算失败只报错、
+以及 128 MiB 限内存下 100 回执 × 4,000 修订的完整回放。

@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from app.db import Database
 from app.main import create_app
+from app.replay_main import create_replay_app
 
 
 @pytest.fixture()
@@ -30,4 +31,11 @@ def app(db_path):
 @pytest.fixture()
 def client(app):
     with TestClient(app) as test_client:
+        yield test_client
+
+
+@pytest.fixture()
+def replay_client():
+    """The detached offline replay service (no database at all)."""
+    with TestClient(create_replay_app()) as test_client:
         yield test_client

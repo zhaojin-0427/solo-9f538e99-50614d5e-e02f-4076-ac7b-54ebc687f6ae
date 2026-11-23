@@ -21,5 +21,27 @@ services:
       retries: 3
       start_period: 10s
 
+  # 离线回放服务：同一镜像，只挂回放端点（app.replay_main），不挂生产数据卷，
+  # 脱离生产库运行。内存限制 128 MiB，验证限内存回放也能返回完整结果。
+  replay:
+    build: .
+    image: windscore-reconcile:latest
+    container_name: windscore-replay
+    command: ["uvicorn", "app.replay_main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${WINDSCORE_REPLAY_PORT:-8001}:8000"
+    mem_limit: 128m
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
 volumes:
   windscore-data:

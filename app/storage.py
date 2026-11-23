@@ -388,6 +388,61 @@ def get_report_items(
     return items, int(total)
 
 
+def list_report_receipt_ids(db: Database, report_id: str) -> list[str]:
+    """All receipt ids covered by a stored report, sorted."""
+    conn = db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT receipt_id FROM report_items WHERE report_id = ? "
+            "ORDER BY receipt_id",
+            (report_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [row["receipt_id"] for row in rows]
+
+
+def get_report_items_for_receipts(
+    db: Database, report_id: str, receipt_ids: Sequence[str]
+) -> list[dict[str, Any]]:
+    """Stored report items (with findings and evidence) for the given receipts.
+
+    This is the only data the replay-bundle export is allowed to use: the
+    receipts and revision trails frozen into the report, never the live
+    warehouse tables.
+    """
+    if not receipt_ids:
+        return []
+    placeholders = ", ".join("?" for _ in receipt_ids)
+    conn = db.connect()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT receipt_id, turbine_id, score_minute, used_sample_minute,
+                   used_revision, usage_json, drift_json, evidence_json
+              FROM report_items
+             WHERE report_id = ? AND receipt_id IN ({placeholders})
+             ORDER BY receipt_id
+            """,
+            [report_id, *receipt_ids],
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "receipt_id": row["receipt_id"],
+            "turbine_id": row["turbine_id"],
+            "score_minute": row["score_minute"],
+            "used_sample_minute": row["used_sample_minute"],
+            "used_revision": row["used_revision"],
+            "usage": json.loads(row["usage_json"]),
+            "drift": json.loads(row["drift_json"]),
+            "evidence": json.loads(row["evidence_json"]),
+        }
+        for row in rows
+    ]
+
+
 def reports_for_receipt(db: Database, receipt_id: str) -> list[dict[str, Any]]:
     conn = db.connect()
     try:

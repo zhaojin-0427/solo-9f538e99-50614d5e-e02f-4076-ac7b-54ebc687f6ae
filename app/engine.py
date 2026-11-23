@@ -74,6 +74,13 @@ class _PairData:
         return self.rows[-1] if self.rows else None
 
 
+# Public aliases for the offline replayer (app.replay): it re-runs the exact
+# same evaluation logic on desensitised bundle data, so it builds these row
+# shapes directly instead of loading them from SQLite.
+Row = _Row
+PairData = _PairData
+
+
 def _instant_cutoff(score_minute: str) -> str:
     """The scoring minute as an instant, for a strict ``<`` comparison."""
     return format_instant(minute_datetime(score_minute))
@@ -513,6 +520,18 @@ def _evaluate(
             }
         )
     return items
+
+
+def evaluate_receipts(
+    receipts: Sequence[Receipt],
+    pairs: dict[tuple[str, str], _PairData],
+) -> list[dict[str, Any]]:
+    """Public wrapper around the batch evaluator.
+
+    The offline replayer calls this with synthetic receipts/pairs rebuilt
+    from a replay bundle so that online and offline runs share one code path.
+    """
+    return _evaluate(receipts, pairs)
 
 
 def reconcile_snapshot(

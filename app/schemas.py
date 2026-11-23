@@ -272,6 +272,26 @@ class ReconcileItem(BaseModel):
     )
 
 
+class ReplayBundleRequest(BaseModel):
+    """Which two stored reports (and which shared receipts) to export."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    report_ids: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=2,
+        description="Exactly two different stored report ids",
+    )
+    receipt_ids: list[str] | None = Field(
+        default=None,
+        description=(
+            "Shared receipt ids to include (max 100). "
+            "Omit to use every receipt present in both reports."
+        ),
+    )
+
+
 class ReportSummary(BaseModel):
     report_id: str
     status: str

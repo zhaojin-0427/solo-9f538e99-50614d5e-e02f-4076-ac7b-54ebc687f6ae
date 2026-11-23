@@ -18,6 +18,7 @@ from fastapi import Body, Depends, FastAPI, File, HTTPException, Query, Request,
 from fastapi.responses import JSONResponse
 
 from . import __version__
+from .bundle import ExportError, build_replay_bundle
 from .db import Database
 from .domain import (
     MAX_BATCH_SIZE,
@@ -30,6 +31,7 @@ from .importer import parse_reading_body, parse_receipt_body, parse_upload
 from .schemas import (
     ImportResult,
     ReconcileRequest,
+    ReplayBundleRequest,
     ReportDetail,
     ReportList,
 )
@@ -87,6 +89,7 @@ def create_app(database_path: str | None = None) -> FastAPI:
             {"name": "导入", "description": "导入分钟风速与打分回执（JSON 或 CSV/JSON 文件）"},
             {"name": "核对", "description": "批量核对并落库报告"},
             {"name": "报告", "description": "按编号查询历史报告"},
+            {"name": "导出", "description": "导出两份报告的脱敏回放包"},
             {"name": "数据", "description": "查看已导入的数仓数据与回执"},
             {"name": "运维", "description": "健康检查"},
         ],
@@ -127,6 +130,10 @@ def create_app(database_path: str | None = None) -> FastAPI:
                 }
             },
         )
+
+    @app.exception_handler(ExportError)
+    async def _export_error(_: Request, exc: ExportError) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.payload})
 
     def get_db() -> Database:
         return app.state.db
@@ -383,6 +390,33 @@ def create_app(database_path: str | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         reports = reports_for_receipt(db, receipt_id)
         return {"receipt_id": receipt_id, "reports": reports, "total": len(reports)}
+
+    # ------------------------------------------------------------------
+    # replay bundle export
+    # ------------------------------------------------------------------
+    @app.post(
+        "/api/export/replay-bundle",
+        tags=["导出"],
+        summary="导出两份报告的脱敏回放包（JSON 下载）",
+        description=(
+            "指定两份不同的已存报告与最多 100 个共有回执号（缺省取全部共有回执），"
+            "下载一个自包含的脱敏 JSON 回放包：只用报告保存的回执与修订轨迹；"
+            "报告号/机组号/回执号替换为包内代号，采样/入仓/打分时间改为相对同一起点的偏移，"
+            "风速只留空值标记，相同的脱敏修订只存一份。"
+            "回放包可上传到离线回放服务（见 replay 容器）重跑。"
+        ),
+    )
+    def export_replay_bundle(
+        request: ReplayBundleRequest,
+        db: Database = Depends(get_db),
+    ) -> JSONResponse:
+        bundle = build_replay_bundle(db, request.report_ids, request.receipt_ids)
+        return JSONResponse(
+            content=bundle,
+            headers={
+                "Content-Disposition": 'attachment; filename="windscore-replay-bundle.json"'
+            },
+        )
 
     # ------------------------------------------------------------------
     # data inspection
